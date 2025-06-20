@@ -1,0 +1,269 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: ceph-nvmeof-gateway
+  name: ceph-nvmeof-gateway
+spec:
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: ceph-nvmeof-gateway
+  template:
+    metadata:
+      labels:
+        app: ceph-nvmeof-gateway
+      name: ceph-nvmeof-gateway
+    spec:
+      containers:
+      - args:
+        - -c
+        - /config/ceph-nvmeof.conf
+        env:
+        - name: ROOK_CEPH_MON_HOST
+          valueFrom:
+            secretKeyRef:
+              key: mon_host
+              name: rook-ceph-config
+        - name: CEPH_ARGS
+          value: --mon-host $(ROOK_CEPH_MON_HOST) --keyring /etc/ceph/keyring
+        - name: ROOK_POD_IP
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: status.podIP
+        image: quay.io/ceph/nvmeof:latest
+        imagePullPolicy: IfNotPresent
+        name: nvmeof-gateway
+        ports:
+        - containerPort: 5500
+          name: gateway
+          protocol: TCP
+        - containerPort: 5499
+          name: monitor
+          protocol: TCP
+        - containerPort: 8009
+          name: discovery
+          protocol: TCP
+        volumeMounts:
+        - mountPath: /etc/ceph
+          name: etc-ceph
+        - mountPath: /config
+          name: gateway-config
+          readOnly: true
+      initContainers:
+      - command:
+        - /bin/bash
+        - -c
+        - |2
+
+          set -xEeuo pipefail
+
+          cat << EOF > /etc/ceph/ceph.conf
+          [global]
+          mon_host = $(ROOK_CEPH_MON_HOST)
+          debug_rados = 20/5
+          log_to_stderr = true
+
+          keyring = /etc/ceph/keyring
+          EOF
+
+          cp /tmp/ceph/keyring /etc/ceph
+
+          chmod 444 /etc/ceph/ceph.conf
+          chmod 440 /etc/ceph/keyring
+
+          cat /etc/ceph/ceph.conf
+        env:
+        - name: ROOK_CEPH_MON_HOST
+          valueFrom:
+            secretKeyRef:
+              key: mon_host
+              name: rook-ceph-config
+        - name: ROOK_CEPH_MON_INITIAL_MEMBERS
+          valueFrom:
+            secretKeyRef:
+              key: mon_initial_members
+              name: rook-ceph-config
+        image: quay.io/ceph/ceph:v19
+        imagePullPolicy: IfNotPresent
+        name: generate-minimal-ceph-conf
+        volumeMounts:
+        - mountPath: /tmp/ceph/
+          name: ceph-admin-keyring
+          readOnly: true
+        - mountPath: /etc/ceph
+          name: etc-ceph
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      serviceAccount: rook-ceph-mgr
+      serviceAccountName: rook-ceph-mgr
+      volumes:
+      - name: ceph-admin-keyring
+        secret:
+          items:
+          - key: keyring
+            path: keyring
+            mode: 292
+          secretName: rook-ceph-admin-keyring
+      - emptyDir: {}
+        name: etc-ceph
+      - name: gateway-config
+        projected:
+          defaultMode: 420
+          sources:
+          - configMap:
+              items:
+              - key: config
+                mode: 292
+                path: ceph-nvmeof.conf
+              name: ceph-nvmeof-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: ceph-nvmeof-gateway
+  name: ceph-nvmeof-gateway
+spec:
+  internalTrafficPolicy: Cluster
+  ports:
+  - name: gateway
+    port: 5500
+    protocol: TCP
+    targetPort: 5500
+  - name: monitor
+    port: 5499
+    protocol: TCP
+    targetPort: 5499
+  - name: discovery
+    port: 8009
+    protocol: TCP
+    targetPort: 8009
+  selector:
+    app: ceph-nvmeof-gateway
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app: ceph-nvmeof-gateway
+  name: ceph-nvmeof-config
+data:
+  config: |-
+    #  based on github.com/ceph/ceph-nvmeof:ceph-nvmeof.conf
+    #
+    #  Copyright (c) 2021 International Business Machines
+    #  All rights reserved.
+    #
+    #  SPDX-License-Identifier: LGPL-3.0-or-later
+    #
+    #  Authors: anita.shekar@ibm.com, sandy.kaur@ibm.com
+    #
+
+    [gateway]
+    name = ceph-nvmeof-gateway
+    group =
+    addr = 0.0.0.0
+    port = 5500
+    enable_auth = False
+    state_update_notify = True
+    state_update_timeout_in_msec = 2000
+    state_update_interval_sec = 5
+    break_update_interval_sec = 25
+    enable_spdk_discovery_controller = False
+    encryption_key = /etc/ceph/encryption.key
+    rebalance_period_sec = 7
+    max_gws_in_grp = 16
+    max_ns_to_change_lb_grp = 8
+    #abort_on_errors = True
+    #omap_file_ignore_unlock_errors = False
+    #omap_file_lock_on_read = True
+    #omap_file_lock_duration = 20
+    #omap_file_lock_retries = 30
+    #omap_file_lock_retry_sleep_interval = 1.0
+    #omap_file_update_reloads = 10
+    #enable_prometheus_exporter = True
+    #prometheus_exporter_ssl = True
+    #prometheus_port = 10008
+    #prometheus_bdev_pools = rbd
+    #prometheus_stats_interval = 10
+    #verify_nqns = True
+    #verify_keys = True
+    #verify_listener_ip = True
+    #allowed_consecutive_spdk_ping_failures = 1
+    #spdk_ping_interval_in_seconds = 2.0
+    #max_hosts_per_namespace = 8
+    #max_namespaces_with_netmask = 1000
+    #max_subsystems = 128
+    #max_hosts = 2048
+    #max_namespaces = 2048
+    #max_namespaces_per_subsystem = 256
+    #max_hosts_per_subsystem = 32
+
+    [gateway-logs]
+    log_level=debug
+    log_files_enabled = False
+    #log_files_rotation_enabled = True
+    #verbose_log_messages = True
+    #max_log_file_size_in_mb=10
+    #max_log_files_count=20
+    #max_log_directory_backups=10
+    #
+    # Notice that if you change the log directory the log files will only be visible inside the container
+    #
+    #log_directory = /var/log/ceph/
+
+    [discovery]
+    addr = 0.0.0.0
+    port = 8009
+    #abort_on_errors = True
+
+    [ceph]
+    id = admin
+    pool = ocs-storagecluster-cephblockpool
+    config_file = /etc/ceph/ceph.conf
+
+    [mtls]
+    server_key = ./server.key
+    client_key = ./client.key
+    server_cert = ./server.crt
+    client_cert = ./client.crt
+
+    [spdk]
+    # Support multiple cluster allocation strategies
+    # Legacy strategy, per ANA grp, max bdevs_per_cluster
+    bdevs_per_cluster = 32
+    # Flat bdevs per cluster, ignore ANA grp id
+    # flat_bdevs_per_cluster = 32
+    # Cluster pool
+    # cluster_connections = 32
+    tgt_path = /usr/local/bin/nvmf_tgt
+    #rpc_socket_dir = /var/tmp/
+    #rpc_socket_name = spdk.sock
+    #tgt_cmd_extra_args = --env-context="--no-huge -m1024" --iova-mode=va
+    timeout = 60.0
+    #log_level =
+    #protocol_log_level = WARNING
+    #log_file_dir =
+
+    # Example value: -m 0x3 -L all
+    # tgt_cmd_extra_args =
+
+    # transports = tcp
+
+    # Example value: {"max_queue_depth" : 16, "max_io_size" : 4194304, "io_unit_size" : 1048576, "zcopy" : false}
+    transport_tcp_options = {"in_capsule_data_size" : 8192, "max_io_qpairs_per_ctrlr" : 7}
+
+    # Example value: {"small_pool_count" : 8192, "large_pool_count" : 1024, "small_bufsize" : 8192, "large_bufsize" : 135168}
+    # iobuf_options =
+
+    qos_timeslice_in_usecs = 0
+    #notifications_interval = 60
+
+    [monitor]
+    #timeout = 1.0
+    #log_file_dir =
