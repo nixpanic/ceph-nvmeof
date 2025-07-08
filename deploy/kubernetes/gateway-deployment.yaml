@@ -1,4 +1,54 @@
 ---
+kind: ServiceAccount
+apiVersion: v1
+metadata:
+  name: ceph-nvmeof
+---
+# ssc based on the Ceph-CSI ssc
+# the "users:" contains a reference to the "openshift-storage" namespace
+#
+kind: SecurityContextConstraints
+apiVersion: security.openshift.io/v1
+metadata:
+  name: "ceph-nvmeof"
+# To allow running privilegedContainers
+allowPrivilegedContainer: true
+# CSI daemonset pod needs hostnetworking
+allowHostNetwork: true
+# This need to be set to true as we use HostPath
+allowHostDirVolumePlugin: true
+priority:
+# SYS_ADMIN is needed for rbd to execute rbd map command
+allowedCapabilities: ["SYS_ADMIN"]
+# Needed as we run liveness container on daemonset pods
+allowHostPorts: true
+# Needed as we are setting this in RBD plugin pod
+allowHostPID: true
+# Required for encryption
+allowHostIPC: true
+# Set to false as we write to RootFilesystem inside csi containers
+readOnlyRootFilesystem: false
+requiredDropCapabilities:
+  - ALL
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+fsGroup:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+# The type of volumes which are mounted to csi pods
+volumes:
+  - configMap
+  - projected
+  - emptyDir
+  - hostPath
+  - secret
+users:
+  # A user needs to be added for each service account.
+  - "system:serviceaccount:openshift-storage:ceph-nvmeof"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -22,21 +72,23 @@ spec:
         - -c
         - /config/ceph-nvmeof.conf
         env:
-        - name: ROOK_CEPH_MON_HOST
+        - name: CEPH_MON_HOST
           valueFrom:
             secretKeyRef:
               key: mon_host
               name: rook-ceph-config
         - name: CEPH_ARGS
-          value: --mon-host $(ROOK_CEPH_MON_HOST) --keyring /etc/ceph/keyring
-        - name: ROOK_POD_IP
-          valueFrom:
-            fieldRef:
-              apiVersion: v1
-              fieldPath: status.podIP
-        image: quay.io/ceph/nvmeof:latest
+          value: --mon-host $(CEPH_MON_HOST) --keyring /etc/ceph/keyring
+        image: quay.io/ceph/nvmeof:devel
         imagePullPolicy: IfNotPresent
         name: nvmeof-gateway
+        securityContext:
+          privileged: true
+          capabilities:
+            add:
+            - SYS_ADMIN
+            drop:
+            - ALL
         ports:
         - containerPort: 5500
           name: gateway
@@ -63,7 +115,7 @@ spec:
 
           cat << EOF > /etc/ceph/ceph.conf
           [global]
-          mon_host = $(ROOK_CEPH_MON_HOST)
+          mon_host = $(CEPH_MON_HOST)
           debug_rados = 20/5
           log_to_stderr = true
 
@@ -77,15 +129,10 @@ spec:
 
           cat /etc/ceph/ceph.conf
         env:
-        - name: ROOK_CEPH_MON_HOST
+        - name: CEPH_MON_HOST
           valueFrom:
             secretKeyRef:
               key: mon_host
-              name: rook-ceph-config
-        - name: ROOK_CEPH_MON_INITIAL_MEMBERS
-          valueFrom:
-            secretKeyRef:
-              key: mon_initial_members
               name: rook-ceph-config
         image: quay.io/ceph/ceph:v19
         imagePullPolicy: IfNotPresent
@@ -98,8 +145,9 @@ spec:
           name: etc-ceph
       dnsPolicy: ClusterFirst
       restartPolicy: Always
-      serviceAccount: rook-ceph-mgr
-      serviceAccountName: rook-ceph-mgr
+      securityContext: {}
+      serviceAccount: ceph-nvmeof
+      serviceAccountName: ceph-nvmeof
       volumes:
       - name: ceph-admin-keyring
         secret:
@@ -154,7 +202,8 @@ metadata:
   name: ceph-nvmeof-config
 data:
   config: |-
-    #  based on github.com/ceph/ceph-nvmeof:ceph-nvmeof.conf
+    # heavily based on tests/ceph-nvmeof.no-huge.conf
+    # Changes are annotated with "TODO:".
     #
     #  Copyright (c) 2021 International Business Machines
     #  All rights reserved.
@@ -165,7 +214,7 @@ data:
     #
 
     [gateway]
-    name = ceph-nvmeof-gateway
+    name =
     group =
     addr = 0.0.0.0
     port = 5500
@@ -173,15 +222,11 @@ data:
     state_update_notify = True
     state_update_timeout_in_msec = 2000
     state_update_interval_sec = 5
-    break_update_interval_sec = 25
     enable_spdk_discovery_controller = False
     encryption_key = /etc/ceph/encryption.key
     rebalance_period_sec = 7
     max_gws_in_grp = 16
     max_ns_to_change_lb_grp = 8
-    #abort_on_errors = True
-    #omap_file_ignore_unlock_errors = False
-    #omap_file_lock_on_read = True
     #omap_file_lock_duration = 20
     #omap_file_lock_retries = 30
     #omap_file_lock_retry_sleep_interval = 1.0
@@ -202,11 +247,15 @@ data:
     #max_hosts = 2048
     #max_namespaces = 2048
     #max_namespaces_per_subsystem = 256
-    #max_hosts_per_subsystem = 32
+    #max_hosts_per_subsystem = 128
+
+    # TODO: disabled monitor client, otherwise hangs at
+    # "MonitorGroup server is listening on 0.0.0.0:5499 for group id"
+    enable_monitor_client = False
 
     [gateway-logs]
     log_level=debug
-    log_files_enabled = False
+    #log_files_enabled = True
     #log_files_rotation_enabled = True
     #verbose_log_messages = True
     #max_log_file_size_in_mb=10
@@ -220,9 +269,9 @@ data:
     [discovery]
     addr = 0.0.0.0
     port = 8009
-    #abort_on_errors = True
 
     [ceph]
+    # TODO: added "id" and updated "pool" for ODF
     id = admin
     pool = ocs-storagecluster-cephblockpool
     config_file = /etc/ceph/ceph.conf
@@ -234,13 +283,8 @@ data:
     client_cert = ./client.crt
 
     [spdk]
-    # Support multiple cluster allocation strategies
-    # Legacy strategy, per ANA grp, max bdevs_per_cluster
     bdevs_per_cluster = 32
-    # Flat bdevs per cluster, ignore ANA grp id
-    # flat_bdevs_per_cluster = 32
-    # Cluster pool
-    # cluster_connections = 32
+    mem_size=4096
     tgt_path = /usr/local/bin/nvmf_tgt
     #rpc_socket_dir = /var/tmp/
     #rpc_socket_name = spdk.sock
@@ -261,8 +305,7 @@ data:
     # Example value: {"small_pool_count" : 8192, "large_pool_count" : 1024, "small_bufsize" : 8192, "large_bufsize" : 135168}
     # iobuf_options =
 
-    qos_timeslice_in_usecs = 0
-    #notifications_interval = 60
+    # qos_timeslice_in_usecs = 0
 
     [monitor]
     #timeout = 1.0
