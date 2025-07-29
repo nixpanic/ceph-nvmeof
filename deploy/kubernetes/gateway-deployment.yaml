@@ -15,18 +15,12 @@ metadata:
 allowPrivilegedContainer: true
 # CSI daemonset pod needs hostnetworking
 allowHostNetwork: true
-# This need to be set to true as we use HostPath
-allowHostDirVolumePlugin: true
 priority:
 # SYS_ADMIN is needed for rbd to execute rbd map command
 allowedCapabilities: ["SYS_ADMIN"]
 # Needed as we run liveness container on daemonset pods
 allowHostPorts: true
-# Needed as we are setting this in RBD plugin pod
-allowHostPID: true
-# Required for encryption
-allowHostIPC: true
-# Set to false as we write to RootFilesystem inside csi containers
+# Set to false as we write to RootFilesystem inside container
 readOnlyRootFilesystem: false
 requiredDropCapabilities:
   - ALL
@@ -43,7 +37,6 @@ volumes:
   - configMap
   - projected
   - emptyDir
-  - hostPath
   - secret
 users:
   # A user needs to be added for each service account.
