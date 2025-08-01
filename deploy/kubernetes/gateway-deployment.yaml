@@ -2,7 +2,9 @@
 kind: ServiceAccount
 apiVersion: v1
 metadata:
-  name: ceph-nvmeof
+  name: ceph-nvmeof-gateway
+  # TODO(warning): multiple references to "openshift-storage"
+  namespace: openshift-storage
 ---
 # ssc based on the Ceph-CSI ssc
 # the "users:" contains a reference to the "openshift-storage" namespace
@@ -17,7 +19,8 @@ allowPrivilegedContainer: true
 allowHostNetwork: true
 priority:
 # SYS_ADMIN is needed for rbd to execute rbd map command
-allowedCapabilities: ["SYS_ADMIN"]
+allowedCapabilities:
+  - "SYS_ADMIN"
 # Needed as we run liveness container on daemonset pods
 allowHostPorts: true
 # Set to false as we write to RootFilesystem inside container
@@ -40,7 +43,7 @@ volumes:
   - secret
 users:
   # A user needs to be added for each service account.
-  - "system:serviceaccount:openshift-storage:ceph-nvmeof"
+  - "system:serviceaccount:openshift-storage:ceph-nvmeof-gateway"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -49,7 +52,7 @@ metadata:
     app: ceph-nvmeof-gateway
   name: ceph-nvmeof-gateway
 spec:
-  replicas: 1
+  replicas: 2
   revisionHistoryLimit: 10
   selector:
     matchLabels:
@@ -63,7 +66,7 @@ spec:
       containers:
       - args:
         - -c
-        - /config/ceph-nvmeof.conf
+        - /etc/ceph/nvmeof.conf
         env:
         - name: CEPH_MON_HOST
           valueFrom:
@@ -83,6 +86,9 @@ spec:
             drop:
             - ALL
         ports:
+        - containerPort: 4420
+          name: io
+          protocol: TCP
         - containerPort: 5500
           name: gateway
           protocol: TCP
@@ -95,9 +101,6 @@ spec:
         volumeMounts:
         - mountPath: /etc/ceph
           name: etc-ceph
-        - mountPath: /config
-          name: gateway-config
-          readOnly: true
       initContainers:
       - command:
         - /bin/bash
@@ -109,7 +112,7 @@ spec:
           cat << EOF > /etc/ceph/ceph.conf
           [global]
           mon_host = $(CEPH_MON_HOST)
-          debug_rados = 20/5
+          #debug_rados = 20/5
           log_to_stderr = true
 
           keyring = /etc/ceph/keyring
@@ -121,26 +124,48 @@ spec:
           chmod 440 /etc/ceph/keyring
 
           cat /etc/ceph/ceph.conf
+
+          sed "s/@@POD_NAME@@/${POD_NAME}/g;s/@@ANA_GROUP@@/${ANA_GROUP}/g;s/@@POD_IP@@/${POD_IP}/g" < /config/ceph-nvmeof.conf > /etc/ceph/nvmeof.conf
         env:
         - name: CEPH_MON_HOST
           valueFrom:
             secretKeyRef:
               key: mon_host
               name: rook-ceph-config
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: ANA_GROUP
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
         image: quay.io/ceph/ceph:v19
         imagePullPolicy: IfNotPresent
         name: generate-minimal-ceph-conf
+        securityContext:
+          capabilities:
+            drop:
+            - ALL
+          privileged: true
         volumeMounts:
         - mountPath: /tmp/ceph/
           name: ceph-admin-keyring
+          readOnly: true
+        - mountPath: /config
+          name: gateway-config
           readOnly: true
         - mountPath: /etc/ceph
           name: etc-ceph
       dnsPolicy: ClusterFirst
       restartPolicy: Always
       securityContext: {}
-      serviceAccount: ceph-nvmeof
-      serviceAccountName: ceph-nvmeof
+      serviceAccount: ceph-nvmeof-gateway
+      serviceAccountName: ceph-nvmeof-gateway
       volumes:
       - name: ceph-admin-keyring
         secret:
@@ -149,8 +174,8 @@ spec:
             path: keyring
             mode: 292
           secretName: rook-ceph-admin-keyring
-      - emptyDir: {}
-        name: etc-ceph
+      - name: etc-ceph
+        emptyDir: {}
       - name: gateway-config
         projected:
           defaultMode: 420
@@ -171,6 +196,10 @@ metadata:
 spec:
   internalTrafficPolicy: Cluster
   ports:
+  - name: io
+    port: 4420
+    protocol: TCP
+    targetPort: 4200
   - name: gateway
     port: 5500
     protocol: TCP
@@ -207,9 +236,9 @@ data:
     #
 
     [gateway]
-    name =
-    group =
-    addr = 0.0.0.0
+    name = @@POD_NAME@@
+    group = @@ANA_GROUP@@
+    addr = @@POD_IP@@
     port = 5500
     enable_auth = False
     state_update_notify = True
@@ -260,7 +289,7 @@ data:
     #log_directory = /var/log/ceph/
 
     [discovery]
-    addr = 0.0.0.0
+    addr = @@POD_IP@@
     port = 8009
 
     [ceph]
